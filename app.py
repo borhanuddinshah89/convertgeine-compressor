@@ -9,6 +9,7 @@ from typing import Literal
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pypdf import PdfReader, PdfWriter
 from starlette.background import BackgroundTask
 
 
@@ -275,4 +276,141 @@ async def compress_pdf(
         raise HTTPException(
             status_code=500,
             detail="An unexpected compression error occurred.",
+        )
+
+
+@app.post("/merge")
+async def merge_pdfs(
+    files: list[UploadFile] = File(...),
+):
+    if len(files) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload at least two PDF files.",
+        )
+
+    if len(files) > 20:
+        raise HTTPException(
+            status_code=400,
+            detail="You can merge a maximum of 20 PDF files at once.",
+        )
+
+    work_directory = tempfile.mkdtemp(prefix="convertgeine-merge-")
+    output_path = Path(work_directory) / "merged.pdf"
+
+    writer = PdfWriter()
+    total_size = 0
+    input_paths: list[Path] = []
+
+    try:
+        for index, uploaded_file in enumerate(files):
+            filename = uploaded_file.filename or f"document-{index + 1}.pdf"
+
+            if not filename.lower().endswith(".pdf"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{filename} is not a PDF file.",
+                )
+
+            input_path = Path(work_directory) / f"input-{index}.pdf"
+            file_size = 0
+
+            with input_path.open("wb") as destination:
+                while True:
+                    chunk = await uploaded_file.read(1024 * 1024)
+
+                    if not chunk:
+                        break
+
+                    file_size += len(chunk)
+                    total_size += len(chunk)
+
+                    if file_size > MAX_FILE_SIZE:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"{filename} exceeds the 25 MB limit.",
+                        )
+
+                    if total_size > 100 * 1024 * 1024:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="The combined upload must be 100 MB or smaller.",
+                        )
+
+                    destination.write(chunk)
+
+            await uploaded_file.close()
+
+            if file_size == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{filename} is empty.",
+                )
+
+            if not validate_pdf_header(input_path):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{filename} is not a valid PDF.",
+                )
+
+            input_paths.append(input_path)
+
+        for input_path in input_paths:
+            reader = PdfReader(str(input_path))
+
+            if reader.is_encrypted:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Password-protected PDFs cannot be merged.",
+                )
+
+            writer.append(reader)
+
+        with output_path.open("wb") as output_file:
+            writer.write(output_file)
+
+        writer.close()
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise HTTPException(
+                status_code=500,
+                detail="The merged PDF could not be created.",
+            )
+
+        return FileResponse(
+            path=output_path,
+            media_type="application/pdf",
+            filename="merged.pdf",
+            headers={
+                "Cache-Control": "no-store",
+                "X-File-Count": str(len(files)),
+                "X-Final-Size": str(output_path.stat().st_size),
+            },
+            background=BackgroundTask(
+                remove_directory,
+                work_directory,
+            ),
+        )
+
+    except HTTPException:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+        remove_directory(work_directory)
+        raise
+
+    except Exception as error:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+        remove_directory(work_directory)
+        print("Unexpected merge error:", repr(error))
+
+        raise HTTPException(
+            status_code=500,
+            detail="The PDF files could not be merged.",
         )
