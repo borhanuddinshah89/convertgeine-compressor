@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -36,40 +37,73 @@ app.add_middleware(
 )
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
+MAX_PROCESSING_SECONDS = 240
 
 CompressionLevel = Literal["maximum", "balanced", "quality"]
 
 
-def cleanup_directory(directory: str) -> None:
+def remove_directory(directory: str) -> None:
     shutil.rmtree(directory, ignore_errors=True)
 
 
-def compression_arguments(level: CompressionLevel) -> list[str]:
-    presets: dict[str, list[str]] = {
+def sanitize_filename(filename: str) -> str:
+    stem = Path(filename).stem
+    safe_stem = re.sub(r"[^a-zA-Z0-9._-]+", "-", stem).strip("-")
+    return safe_stem or "document"
+
+
+def ghostscript_options(level: CompressionLevel) -> list[str]:
+    options: dict[str, list[str]] = {
         "maximum": [
             "-dPDFSETTINGS=/screen",
+            "-dDownsampleColorImages=true",
+            "-dColorImageDownsampleType=/Bicubic",
             "-dColorImageResolution=96",
+            "-dDownsampleGrayImages=true",
+            "-dGrayImageDownsampleType=/Bicubic",
             "-dGrayImageResolution=96",
+            "-dDownsampleMonoImages=true",
+            "-dMonoImageDownsampleType=/Subsample",
             "-dMonoImageResolution=150",
             "-dJPEGQ=45",
         ],
         "balanced": [
             "-dPDFSETTINGS=/ebook",
+            "-dDownsampleColorImages=true",
+            "-dColorImageDownsampleType=/Bicubic",
             "-dColorImageResolution=150",
+            "-dDownsampleGrayImages=true",
+            "-dGrayImageDownsampleType=/Bicubic",
             "-dGrayImageResolution=150",
+            "-dDownsampleMonoImages=true",
+            "-dMonoImageDownsampleType=/Subsample",
             "-dMonoImageResolution=300",
             "-dJPEGQ=68",
         ],
         "quality": [
             "-dPDFSETTINGS=/printer",
+            "-dDownsampleColorImages=true",
+            "-dColorImageDownsampleType=/Bicubic",
             "-dColorImageResolution=220",
+            "-dDownsampleGrayImages=true",
+            "-dGrayImageDownsampleType=/Bicubic",
             "-dGrayImageResolution=220",
+            "-dDownsampleMonoImages=true",
+            "-dMonoImageDownsampleType=/Subsample",
             "-dMonoImageResolution=300",
             "-dJPEGQ=82",
         ],
     }
 
-    return presets[level]
+    return options[level]
+
+
+def validate_pdf_header(path: Path) -> bool:
+    try:
+        with path.open("rb") as pdf_file:
+            return pdf_file.read(5) == b"%PDF-"
+    except OSError:
+        return False
 
 
 @app.get("/")
@@ -82,7 +116,10 @@ def root() -> dict[str, str]:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "ghostscript": shutil.which("gs") or "not-found",
+    }
 
 
 @app.post("/compress")
@@ -90,9 +127,9 @@ async def compress_pdf(
     file: UploadFile = File(...),
     level: CompressionLevel = Form("balanced"),
 ):
-    original_name = file.filename or "document.pdf"
+    original_filename = file.filename or "document.pdf"
 
-    if not original_name.lower().endswith(".pdf"):
+    if not original_filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=400,
             detail="The selected file must be a PDF.",
@@ -104,13 +141,18 @@ async def compress_pdf(
     final_path = Path(work_directory) / "final.pdf"
 
     try:
-        total_size = 0
+        original_size = 0
 
         with input_path.open("wb") as destination:
-            while chunk := await file.read(1024 * 1024):
-                total_size += len(chunk)
+            while True:
+                chunk = await file.read(1024 * 1024)
 
-                if total_size > MAX_FILE_SIZE:
+                if not chunk:
+                    break
+
+                original_size += len(chunk)
+
+                if original_size > MAX_FILE_SIZE:
                     raise HTTPException(
                         status_code=413,
                         detail="The PDF must be 25 MB or smaller.",
@@ -118,10 +160,18 @@ async def compress_pdf(
 
                 destination.write(chunk)
 
-        if total_size == 0:
+        await file.close()
+
+        if original_size == 0:
             raise HTTPException(
                 status_code=400,
                 detail="The uploaded PDF is empty.",
+            )
+
+        if not validate_pdf_header(input_path):
+            raise HTTPException(
+                status_code=400,
+                detail="The selected file is not a valid PDF.",
             )
 
         command = [
@@ -129,14 +179,16 @@ async def compress_pdf(
             "-sDEVICE=pdfwrite",
             "-dCompatibilityLevel=1.6",
             "-dNOPAUSE",
-            "-dQUIET",
             "-dBATCH",
+            "-dQUIET",
             "-dSAFER",
             "-dDetectDuplicateImages=true",
             "-dCompressFonts=true",
             "-dSubsetFonts=true",
             "-dAutoRotatePages=/None",
-            *compression_arguments(level),
+            "-dPreserveAnnots=true",
+            "-dPreserveMarkedContent=true",
+            *ghostscript_options(level),
             f"-sOutputFile={compressed_path}",
             str(input_path),
         ]
@@ -145,14 +197,14 @@ async def compress_pdf(
             command,
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=MAX_PROCESSING_SECONDS,
             check=False,
         )
 
         if process.returncode != 0 or not compressed_path.exists():
-            error_text = (process.stderr or process.stdout).lower()
+            diagnostic = f"{process.stderr}\n{process.stdout}".lower()
 
-            if "password" in error_text or "encrypted" in error_text:
+            if "password" in diagnostic or "encrypted" in diagnostic:
                 message = (
                     "Password-protected or encrypted PDFs "
                     "are not supported."
@@ -166,31 +218,24 @@ async def compress_pdf(
             raise HTTPException(status_code=422, detail=message)
 
         compressed_size = compressed_path.stat().st_size
+
         compression_applied = (
-            compressed_size > 0 and compressed_size < total_size
+            compressed_size > 0 and compressed_size < original_size
         )
 
-        if compression_applied:
-            shutil.copyfile(compressed_path, final_path)
-        else:
-            shutil.copyfile(input_path, final_path)
+        source_path = compressed_path if compression_applied else input_path
+        shutil.copyfile(source_path, final_path)
 
         final_size = final_path.stat().st_size
 
         saved_percent = (
-            round((1 - final_size / total_size) * 100)
+            max(0, round((1 - final_size / original_size) * 100))
             if compression_applied
             else 0
         )
 
-        safe_stem = "".join(
-            character
-            if character.isalnum() or character in "._-"
-            else "-"
-            for character in Path(original_name).stem
-        ).strip("-") or "document"
-
-        download_name = f"compressed-{safe_stem}.pdf"
+        safe_name = sanitize_filename(original_filename)
+        download_name = f"compressed-{safe_name}.pdf"
 
         return FileResponse(
             path=final_path,
@@ -198,7 +243,7 @@ async def compress_pdf(
             filename=download_name,
             headers={
                 "Cache-Control": "no-store",
-                "X-Original-Size": str(total_size),
+                "X-Original-Size": str(original_size),
                 "X-Final-Size": str(final_size),
                 "X-Saved-Percent": str(saved_percent),
                 "X-Compression-Applied": (
@@ -206,25 +251,26 @@ async def compress_pdf(
                 ),
             },
             background=BackgroundTask(
-                cleanup_directory,
+                remove_directory,
                 work_directory,
             ),
         )
 
     except HTTPException:
-        cleanup_directory(work_directory)
+        remove_directory(work_directory)
         raise
 
     except subprocess.TimeoutExpired:
-        cleanup_directory(work_directory)
+        remove_directory(work_directory)
+
         raise HTTPException(
             status_code=504,
             detail="Compression took too long. Try a smaller PDF.",
         )
 
     except Exception as error:
-        cleanup_directory(work_directory)
-        print("Compression error:", repr(error))
+        remove_directory(work_directory)
+        print("Unexpected compression error:", repr(error))
 
         raise HTTPException(
             status_code=500,
