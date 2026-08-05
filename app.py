@@ -414,3 +414,198 @@ async def merge_pdfs(
             status_code=500,
             detail="The PDF files could not be merged.",
         )
+
+
+def parse_page_selection(value: str, total_pages: int) -> list[int]:
+    selected: list[int] = []
+    seen: set[int] = set()
+
+    for item in value.split(","):
+        item = item.strip()
+
+        if not item:
+            continue
+
+        if "-" in item:
+            parts = item.split("-", 1)
+
+            if len(parts) != 2:
+                raise ValueError("Invalid page range.")
+
+            start_text, end_text = parts[0].strip(), parts[1].strip()
+
+            if not start_text.isdigit() or not end_text.isdigit():
+                raise ValueError("Page ranges must contain numbers.")
+
+            start = int(start_text)
+            end = int(end_text)
+
+            if start > end:
+                raise ValueError(
+                    f"Invalid range {start}-{end}. "
+                    "The first page must be smaller."
+                )
+
+            page_numbers = range(start, end + 1)
+        else:
+            if not item.isdigit():
+                raise ValueError(
+                    "Pages must look like 1-3,5,7."
+                )
+
+            page_numbers = [int(item)]
+
+        for page_number in page_numbers:
+            if page_number < 1 or page_number > total_pages:
+                raise ValueError(
+                    f"Page {page_number} is outside the PDF. "
+                    f"This document has {total_pages} pages."
+                )
+
+            zero_based_index = page_number - 1
+
+            if zero_based_index not in seen:
+                seen.add(zero_based_index)
+                selected.append(zero_based_index)
+
+    if not selected:
+        raise ValueError("Please enter at least one page.")
+
+    return selected
+
+
+@app.post("/split")
+async def split_pdf(
+    file: UploadFile = File(...),
+    pages: str = Form(...),
+):
+    original_filename = file.filename or "document.pdf"
+
+    if not original_filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="The selected file must be a PDF.",
+        )
+
+    work_directory = tempfile.mkdtemp(
+        prefix="convertgeine-split-"
+    )
+    input_path = Path(work_directory) / "input.pdf"
+    output_path = Path(work_directory) / "split-pages.pdf"
+
+    writer = PdfWriter()
+
+    try:
+        file_size = 0
+
+        with input_path.open("wb") as destination:
+            while True:
+                chunk = await file.read(1024 * 1024)
+
+                if not chunk:
+                    break
+
+                file_size += len(chunk)
+
+                if file_size > MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="The PDF must be 25 MB or smaller.",
+                    )
+
+                destination.write(chunk)
+
+        await file.close()
+
+        if file_size == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded PDF is empty.",
+            )
+
+        if not validate_pdf_header(input_path):
+            raise HTTPException(
+                status_code=400,
+                detail="The selected file is not a valid PDF.",
+            )
+
+        reader = PdfReader(str(input_path))
+
+        if reader.is_encrypted:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Password-protected PDFs cannot be split."
+                ),
+            )
+
+        total_pages = len(reader.pages)
+
+        try:
+            selected_pages = parse_page_selection(
+                pages,
+                total_pages,
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=400,
+                detail=str(error),
+            ) from error
+
+        for page_index in selected_pages:
+            writer.add_page(reader.pages[page_index])
+
+        with output_path.open("wb") as output_file:
+            writer.write(output_file)
+
+        writer.close()
+
+        if (
+            not output_path.exists()
+            or output_path.stat().st_size == 0
+        ):
+            raise HTTPException(
+                status_code=500,
+                detail="The split PDF could not be created.",
+            )
+
+        safe_name = sanitize_filename(original_filename)
+
+        return FileResponse(
+            path=output_path,
+            media_type="application/pdf",
+            filename=f"split-{safe_name}.pdf",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Original-Pages": str(total_pages),
+                "X-Selected-Pages": str(len(selected_pages)),
+                "X-Final-Size": str(output_path.stat().st_size),
+            },
+            background=BackgroundTask(
+                remove_directory,
+                work_directory,
+            ),
+        )
+
+    except HTTPException:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+        remove_directory(work_directory)
+        raise
+
+    except Exception as error:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+        remove_directory(work_directory)
+        print("Unexpected split error:", repr(error))
+
+        raise HTTPException(
+            status_code=500,
+            detail="The PDF could not be split.",
+        )
