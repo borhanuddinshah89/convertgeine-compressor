@@ -1,0 +1,10 @@
+RANGER TOOL
+
+Name: rotate-pdf
+
+Status:
+[ ] Backend
+[ ] Frontend
+[ ] SEO
+[ ] Test
+[ ] Deploy
