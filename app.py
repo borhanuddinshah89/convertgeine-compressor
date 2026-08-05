@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pypdf import PdfReader, PdfWriter
 from starlette.background import BackgroundTask
+from routes.pdf_to_jpg import router as pdf_to_jpg_router
 
 
 app = FastAPI(
@@ -38,6 +39,8 @@ app.add_middleware(
 )
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
+
+app.include_router(pdf_to_jpg_router)
 MAX_PROCESSING_SECONDS = 240
 
 CompressionLevel = Literal["maximum", "balanced", "quality"]
